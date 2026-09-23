@@ -8,9 +8,11 @@ Covers a subset of the full checklist in `DoW data vis project.md`:
 Run: streamlit run app.py
 """
 import os
+import re
 import sqlite3
 import sys
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -18,6 +20,7 @@ SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), "scripts")
 sys.path.insert(0, SCRIPTS_DIR)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "db", "dow_budget.sqlite")
+STOCK_SNAPSHOT_PATH = os.path.join(os.path.dirname(__file__), "data", "stock_snapshot.parquet")
 
 EXHIBIT_LABELS = {"P1": "Procurement (P-1)", "O1": "Operations & Maintenance (O-1)",
                    "R1": "RDT&E (R-1)", "RF1": "Working Capital Fund (RF-1)"}
@@ -52,13 +55,27 @@ def ensure_database():
             ingest.main()
 
     if not has_stock:
-        with st.spinner("First run: fetching defense-contractor stock data (yfinance)..."):
-            try:
-                import ingest_stocks
-                ingest_stocks.main()
-            except Exception as e:
-                st.warning(f"Stock data fetch failed ({e}); budget dashboards will still work, "
-                           "but stock/correlation tabs will be empty.")
+        # Prefer the committed snapshot over a live yfinance fetch: Yahoo Finance
+        # frequently blocks/rate-limits requests from cloud-provider IP ranges
+        # (confirmed on Streamlit Community Cloud -- the live fetch that works
+        # fine locally silently returned nothing there), so a live fetch at
+        # deploy time is not reliable. Fall back to a live fetch only if no
+        # snapshot has been committed yet.
+        if os.path.exists(STOCK_SNAPSHOT_PATH):
+            with st.spinner("First run: loading defense-contractor stock snapshot..."):
+                conn = sqlite3.connect(DB_PATH)
+                snap = pd.read_parquet(STOCK_SNAPSHOT_PATH)
+                snap.to_sql("stock_price", conn, if_exists="append", index=False)
+                conn.commit()
+                conn.close()
+        else:
+            with st.spinner("First run: fetching defense-contractor stock data (yfinance)..."):
+                try:
+                    import ingest_stocks
+                    ingest_stocks.main()
+                except Exception as e:
+                    st.warning(f"Stock data fetch failed ({e}); budget dashboards will still work, "
+                               "but stock/correlation tabs will be empty.")
     return True
 
 
@@ -92,6 +109,51 @@ def load_procurement_detail(fiscal_year):
     )
     conn.close()
     return df
+
+
+def _normalize_activity(title):
+    """DoD budget activity titles drift in case/wording across vintages (e.g.
+    "AIRCRAFT" vs "Aircraft", "... AND ..." vs "... & ..."), which fragments a
+    multi-year trend if left as-is. This merges the common variants; a few
+    finer abbreviation differences (e.g. "Supt" vs "Support") can still slip
+    through as separate categories."""
+    if title is None:
+        return None
+    t = str(title).upper().strip()
+    t = re.sub(r"\s+AND\s+", " & ", t)
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+@st.cache_data
+def load_procurement_by_activity(fiscal_year):
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql(
+        """SELECT budget_activity_title, SUM(amount_thousands) / 1e6 AS billions
+           FROM budget_line
+           WHERE exhibit_type = 'P1' AND fiscal_year = ? AND amount_type = 'request'
+           GROUP BY budget_activity_title""",
+        conn, params=(fiscal_year,),
+    )
+    conn.close()
+    df["activity"] = df["budget_activity_title"].map(_normalize_activity)
+    grouped = df.groupby("activity", as_index=False)["billions"].sum()
+    return grouped[grouped.billions > 0].sort_values("billions", ascending=False)
+
+
+@st.cache_data
+def load_procurement_trend():
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql(
+        """SELECT fiscal_year, budget_activity_title, SUM(amount_thousands) / 1e6 AS billions
+           FROM budget_line
+           WHERE exhibit_type = 'P1' AND amount_type = 'request'
+           GROUP BY fiscal_year, budget_activity_title""",
+        conn,
+    )
+    conn.close()
+    df["activity"] = df["budget_activity_title"].map(_normalize_activity)
+    return df.groupby(["fiscal_year", "activity"], as_index=False)["billions"].sum()
 
 
 @st.cache_data
@@ -141,8 +203,47 @@ with tab_procurement:
     st.subheader("Procurement (P-1) breakdown by budget activity")
     years = sorted(budget_df[budget_df.exhibit_type == "P1"].fiscal_year.unique(), reverse=True)
     year_choice = st.selectbox("Fiscal year (request amount)", years)
+
+    by_activity = load_procurement_by_activity(int(year_choice))
+    top_n = by_activity.head(15)
+
+    col_pie, col_bar = st.columns(2)
+    with col_pie:
+        pie = (
+            alt.Chart(top_n)
+            .mark_arc()
+            .encode(
+                theta=alt.Theta("billions:Q"),
+                color=alt.Color("activity:N", legend=alt.Legend(title="Budget activity", symbolLimit=15)),
+                tooltip=["activity", alt.Tooltip("billions:Q", title="$B", format=".1f")],
+            )
+            .properties(height=420)
+        )
+        st.altair_chart(pie, width="stretch")
+    with col_bar:
+        st.bar_chart(top_n.set_index("activity")["billions"], height=420)
+    st.caption(f"Top {len(top_n)} budget activities by FY{year_choice} request $ (billions), summed across branches. "
+               "Category names are case/wording-normalized across vintages, but a few finer abbreviation "
+               "differences may still appear as separate slices.")
+
+    st.markdown("#### Trend over time by budget activity")
+    trend = load_procurement_trend()
+    all_activities = sorted(a for a in trend.activity.dropna().unique())
+    default_activities = (
+        trend.groupby("activity")["billions"].sum().sort_values(ascending=False).head(6).index.tolist()
+    )
+    chosen_activities = st.multiselect("Budget activities to trend", all_activities, default=default_activities)
+    if chosen_activities:
+        trend_pivot = (
+            trend[trend.activity.isin(chosen_activities)]
+            .pivot(index="fiscal_year", columns="activity", values="billions")
+            .sort_index()
+        )
+        st.line_chart(trend_pivot)
+    st.caption("Units: billions of dollars, request amount, summed across branches.")
+
+    st.markdown("#### Detail by branch")
     detail = load_procurement_detail(int(year_choice))
-    st.bar_chart(detail.set_index("budget_activity_title")["billions"].head(20))
     st.dataframe(detail, width="stretch")
     st.caption("Units: billions of dollars.")
 

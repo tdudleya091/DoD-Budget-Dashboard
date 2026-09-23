@@ -22,6 +22,7 @@ import tickers
 import stockdata as dd
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "dow_budget.sqlite")
+SNAPSHOT_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "stock_snapshot.parquet")
 
 
 def fetch_company(company, ticker_symbol):
@@ -89,6 +90,15 @@ def main():
     conn.commit()
     print(f"\nLoaded {len(all_df)} stock_price rows into {DB_PATH}")
     conn.close()
+
+    # Also write a committed snapshot -- Yahoo Finance frequently blocks/rate-limits
+    # requests from cloud-provider IP ranges (Streamlit Cloud included), so a live
+    # yfinance fetch at deploy time is unreliable. app.py loads this snapshot
+    # instead of fetching live; re-run this script locally and commit the
+    # refreshed file whenever the data needs updating.
+    os.makedirs(os.path.dirname(SNAPSHOT_PATH), exist_ok=True)
+    all_df.to_parquet(SNAPSHOT_PATH, index=False)
+    print(f"Wrote snapshot to {SNAPSHOT_PATH}")
 
 
 if __name__ == "__main__":
