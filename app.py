@@ -253,6 +253,22 @@ with tab_procurement:
     st.dataframe(detail, width="stretch")
     st.caption("Units: billions of dollars.")
 
+@st.cache_data
+def monthly_market_cap_pivot(chosen_companies):
+    """Daily history for some tickers (Boeing, GE, Honeywell) runs back to 1962
+    -- plotting several companies' full daily series at once sends tens of
+    thousands of raw points to the browser chart and visibly lags. Resampling
+    to month-end values cuts that by ~20x with no real loss of visual trend,
+    and caching keyed on the company selection avoids redoing this work on
+    every unrelated widget interaction elsewhere in the app (Streamlit reruns
+    the whole script top-to-bottom on any rerun)."""
+    sub = stock_df.loc[stock_df.company.isin(chosen_companies), ["date", "company", "market_cap_usd"]]
+    monthly = (
+        sub.set_index("date").groupby("company")["market_cap_usd"].resample("ME").last().reset_index()
+    )
+    return monthly.pivot(index="date", columns="company", values="market_cap_usd") / 1e9
+
+
 with tab_stocks:
     st.subheader("Defense-contractor market cap over time")
     if stock_df.empty:
@@ -262,10 +278,11 @@ with tab_stocks:
         companies = sorted(stock_df.company.unique())
         chosen = st.multiselect("Companies", companies, default=["Lockheed Martin", "Boeing", "General Dynamics", "HII"])
         if chosen:
-            sub = stock_df[stock_df.company.isin(chosen)]
-            pivot_mc = sub.pivot_table(index="date", columns="company", values="market_cap_usd") / 1e9
+            pivot_mc = monthly_market_cap_pivot(tuple(sorted(chosen)))
             st.line_chart(pivot_mc)
-        st.caption("Units: billions of USD. Note: a few small/thinly-traded tickers (e.g. Vision Marine Technologies) "
+        st.caption("Shown as monthly values (not daily) to keep the chart responsive -- some tickers have "
+                    "60+ years of daily history. Units: billions of USD. Note: a few small/thinly-traded tickers "
+                    "(e.g. Vision Marine Technologies) "
                    "show unreliable market-cap history because yfinance only exposes current shares-outstanding, which "
                    "gets misapplied to pre-split prices -- treat outliers with suspicion rather than as ground truth.")
 
