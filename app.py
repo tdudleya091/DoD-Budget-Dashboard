@@ -44,7 +44,8 @@ def ensure_database():
     runs once per running app instance, not on every rerun/widget interaction.
     """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    from schema import create_db
+    conn = create_db(DB_PATH)  # idempotent CREATE TABLE IF NOT EXISTS for both tables
     has_budget = _table_has_rows(conn, "budget_line")
     has_stock = _table_has_rows(conn, "stock_price")
     conn.close()
@@ -54,28 +55,33 @@ def ensure_database():
             import ingest
             ingest.main()
 
-    if not has_stock:
-        # Prefer the committed snapshot over a live yfinance fetch: Yahoo Finance
-        # frequently blocks/rate-limits requests from cloud-provider IP ranges
-        # (confirmed on Streamlit Community Cloud -- the live fetch that works
-        # fine locally silently returned nothing there), so a live fetch at
-        # deploy time is not reliable. Fall back to a live fetch only if no
-        # snapshot has been committed yet.
-        if os.path.exists(STOCK_SNAPSHOT_PATH):
-            with st.spinner("First run: loading defense-contractor stock snapshot..."):
-                conn = sqlite3.connect(DB_PATH)
-                snap = pd.read_parquet(STOCK_SNAPSHOT_PATH)
-                snap.to_sql("stock_price", conn, if_exists="append", index=False)
-                conn.commit()
-                conn.close()
-        else:
-            with st.spinner("First run: fetching defense-contractor stock data (yfinance)..."):
-                try:
-                    import ingest_stocks
-                    ingest_stocks.main()
-                except Exception as e:
-                    st.warning(f"Stock data fetch failed ({e}); budget dashboards will still work, "
-                               "but stock/correlation tabs will be empty.")
+    # Prefer the committed snapshot over a live yfinance fetch: Yahoo Finance
+    # blocks/rate-limits requests from cloud-provider IP ranges (confirmed on
+    # Streamlit Community Cloud), and its price-history and fundamentals
+    # (.info, used for shares-outstanding/book-value/EPS) endpoints appear to
+    # be rate-limited *separately* -- an earlier deploy attempt could leave
+    # stock_price populated with prices but every market_cap/pb/pe NULL,
+    # which a simple "does this table have any rows" check would treat as
+    # already-loaded and skip. So: always (re)load from the snapshot when one
+    # is committed, rather than only when the table looks empty. This is a
+    # cheap operation (~1-2s for the full history) so re-running it on every
+    # fresh process start costs nothing.
+    if os.path.exists(STOCK_SNAPSHOT_PATH):
+        with st.spinner("Loading defense-contractor stock snapshot..."):
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("DELETE FROM stock_price")
+            snap = pd.read_parquet(STOCK_SNAPSHOT_PATH)
+            snap.to_sql("stock_price", conn, if_exists="append", index=False)
+            conn.commit()
+            conn.close()
+    elif not has_stock:
+        with st.spinner("First run: fetching defense-contractor stock data (yfinance)..."):
+            try:
+                import ingest_stocks
+                ingest_stocks.main()
+            except Exception as e:
+                st.warning(f"Stock data fetch failed ({e}); budget dashboards will still work, "
+                           "but stock/correlation tabs will be empty.")
     return True
 
 
