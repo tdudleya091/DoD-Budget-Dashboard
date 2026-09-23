@@ -7,6 +7,12 @@ import sys
 
 import pandas as pd
 
+# make sibling modules (parsers, schema) importable regardless of how this
+# file is invoked -- a plain `python3 ingest.py` gets this for free via cwd,
+# but that isn't guaranteed under every runner (e.g. Streamlit's script
+# executor), so make it explicit
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from parsers import RECORD_FIELDS, parse_flat_sheet, parse_legacy_o1_hierarchical
 from schema import create_db
 
@@ -87,5 +93,24 @@ def main():
     conn.close()
 
 
+def _running_under_streamlit():
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
-    main()
+    if _running_under_streamlit():
+        # The deployed Streamlit Cloud app is configured with this file
+        # ("scripts/ingest.py") as its main module instead of the real
+        # dashboard at ../app.py, and that setting isn't exposed for editing
+        # on this deployment -- so when Streamlit runs this file directly,
+        # hand off to the actual dashboard instead of doing plain CLI
+        # ingestion (which has no UI and would render a blank page).
+        import runpy
+        app_path = os.path.join(os.path.dirname(__file__), "..", "app.py")
+        runpy.run_path(app_path, run_name="__main__")
+    else:
+        main()

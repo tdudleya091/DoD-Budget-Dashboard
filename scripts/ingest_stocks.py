@@ -9,8 +9,13 @@ cross-repo) so this project is self-contained and works on a fresh deploy
 that only has this one repo checked out (e.g. Streamlit Community Cloud).
 """
 import os
+import sys
 
 import pandas as pd
+
+# make sibling modules importable regardless of how this file is invoked --
+# see ingest.py for why this can't be left implicit
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from schema import create_db
 import tickers
