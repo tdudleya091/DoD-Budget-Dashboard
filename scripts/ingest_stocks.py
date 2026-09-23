@@ -2,22 +2,19 @@
 same SQLite db as the budget data, so dashboards can join budget spend
 against company market cap/valuation by year.
 
-Reuses the ticker universe and fetch/dead-stock-handling logic already built
-in ../../defense-dashboard/ rather than reimplementing it -- see that
-project's tickers.py/data.py for the "why" behind ticker choices and the
-dead-stock truncation rule.
+Ticker universe and fetch/dead-stock-handling logic (tickers.py/stockdata.py,
+in this same directory) were originally built for and are still shared with
+the sibling defense-dashboard project -- vendored here (not imported
+cross-repo) so this project is self-contained and works on a fresh deploy
+that only has this one repo checked out (e.g. Streamlit Community Cloud).
 """
 import os
-import sys
 
 import pandas as pd
 
 from schema import create_db
-
-DEFENSE_DASHBOARD = os.path.join(os.path.dirname(__file__), "..", "..", "defense-dashboard")
-sys.path.insert(0, DEFENSE_DASHBOARD)
-import tickers  # noqa: E402
-import data as dd  # noqa: E402
+import tickers
+import stockdata as dd
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "dow_budget.sqlite")
 

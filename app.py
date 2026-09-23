@@ -9,14 +9,60 @@ Run: streamlit run app.py
 """
 import os
 import sqlite3
+import sys
 
 import pandas as pd
 import streamlit as st
+
+SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), "scripts")
+sys.path.insert(0, SCRIPTS_DIR)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "db", "dow_budget.sqlite")
 
 EXHIBIT_LABELS = {"P1": "Procurement (P-1)", "O1": "Operations & Maintenance (O-1)",
                    "R1": "RDT&E (R-1)", "RF1": "Working Capital Fund (RF-1)"}
+
+
+def _table_has_rows(conn, table):
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    if not exists:
+        return False
+    return conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+
+
+@st.cache_resource
+def ensure_database():
+    """Builds db/dow_budget.sqlite from raw_data/ (and fetches stock data) on
+    first run of a fresh deploy -- the db file itself is gitignored (it's
+    regenerable and stock data changes daily), so a clean checkout like
+    Streamlit Community Cloud's has no db until this runs. Cached so it only
+    runs once per running app instance, not on every rerun/widget interaction.
+    """
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    has_budget = _table_has_rows(conn, "budget_line")
+    has_stock = _table_has_rows(conn, "stock_price")
+    conn.close()
+
+    if not has_budget:
+        with st.spinner("First run: parsing DoD budget exhibits into the database..."):
+            import ingest
+            ingest.main()
+
+    if not has_stock:
+        with st.spinner("First run: fetching defense-contractor stock data (yfinance)..."):
+            try:
+                import ingest_stocks
+                ingest_stocks.main()
+            except Exception as e:
+                st.warning(f"Stock data fetch failed ({e}); budget dashboards will still work, "
+                           "but stock/correlation tabs will be empty.")
+    return True
+
+
+ensure_database()
 
 
 @st.cache_data
@@ -97,23 +143,30 @@ with tab_procurement:
     year_choice = st.selectbox("Fiscal year (request amount)", years)
     detail = load_procurement_detail(int(year_choice))
     st.bar_chart(detail.set_index("budget_activity_title")["billions"].head(20))
-    st.dataframe(detail, use_container_width=True)
+    st.dataframe(detail, width="stretch")
     st.caption("Units: billions of dollars.")
 
 with tab_stocks:
     st.subheader("Defense-contractor market cap over time")
-    companies = sorted(stock_df.company.unique())
-    chosen = st.multiselect("Companies", companies, default=["Lockheed Martin", "Boeing", "General Dynamics", "HII"])
-    if chosen:
-        sub = stock_df[stock_df.company.isin(chosen)]
-        pivot_mc = sub.pivot_table(index="date", columns="company", values="market_cap_usd") / 1e9
-        st.line_chart(pivot_mc)
-    st.caption("Units: billions of USD. Note: a few small/thinly-traded tickers (e.g. Vision Marine Technologies) "
-               "show unreliable market-cap history because yfinance only exposes current shares-outstanding, which "
-               "gets misapplied to pre-split prices -- treat outliers with suspicion rather than as ground truth.")
+    if stock_df.empty:
+        st.info("No stock data available yet (the yfinance fetch may have failed on startup). "
+                "Budget dashboards above are unaffected.")
+    else:
+        companies = sorted(stock_df.company.unique())
+        chosen = st.multiselect("Companies", companies, default=["Lockheed Martin", "Boeing", "General Dynamics", "HII"])
+        if chosen:
+            sub = stock_df[stock_df.company.isin(chosen)]
+            pivot_mc = sub.pivot_table(index="date", columns="company", values="market_cap_usd") / 1e9
+            st.line_chart(pivot_mc)
+        st.caption("Units: billions of USD. Note: a few small/thinly-traded tickers (e.g. Vision Marine Technologies) "
+                   "show unreliable market-cap history because yfinance only exposes current shares-outstanding, which "
+                   "gets misapplied to pre-split prices -- treat outliers with suspicion rather than as ground truth.")
 
 with tab_correlation:
     st.subheader("Sub-industry spend vs. combined market cap")
+    if stock_df.empty:
+        st.info("No stock data available yet (the yfinance fetch may have failed on startup).")
+        st.stop()
     sub_industry = st.radio("Sub-industry", ["Aviation", "Shipbuilding"], horizontal=True)
     branch_for_industry = "Air Force" if sub_industry == "Aviation" else "Navy"
     spend = (
